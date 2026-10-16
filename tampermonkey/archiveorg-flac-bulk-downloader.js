@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Archive.org FLAC Bulk Downloader
 // @namespace    https://github.com/Baivo/violent-tampermonkey-scripts
-// @version      2.0
-// @description  One-click bulk download of all FLAC files from any archive.org download page
+// @version      2.1
+// @description  One-click bulk download of all FLAC files from any archive.org download page, into a folder you pick
 // @author       Baivo
 // @match        https://archive.org/download/*
 // @connect      archive.org
+// @grant        unsafeWindow
 // @grant        GM_download
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -80,6 +81,28 @@
             return rate;
         };
     }
+
+    // Page window: the folder picker and IndexedDB must be called on the real
+    // window, not the userscript sandbox wrapper.
+    var W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    var hasFS = typeof W.showDirectoryPicker === 'function';
+
+    // Tiny IndexedDB key/value store; directory handles can't go in GM_setValue.
+    function idb(mode, fn) {
+        return new Promise(function (resolve, reject) {
+            var open = W.indexedDB.open('flac-dl', 1);
+            open.onupgradeneeded = function () { open.result.createObjectStore('kv'); };
+            open.onerror = function () { reject(open.error); };
+            open.onsuccess = function () {
+                var tx = open.result.transaction('kv', mode);
+                var req = fn(tx.objectStore('kv'));
+                tx.oncomplete = function () { open.result.close(); resolve(req.result); };
+                tx.onerror = function () { open.result.close(); reject(tx.error); };
+            };
+        });
+    }
+    function idbGet(k)    { return idb('readonly',  function (s) { return s.get(k); }); }
+    function idbSet(k, v) { return idb('readwrite', function (s) { return s.put(v, k); }); }
 
     function el(tag, cls, text) {
         var e = document.createElement(tag);
@@ -164,6 +187,18 @@ button { font-family: var(--mono); }
 .field { display: block; margin-bottom: 8px; }
 .label { display: block; font-size: 11px; color: #aaa; letter-spacing: .08em; margin-bottom: 4px; }
 .label em { font-style: normal; color: #707070; margin-left: 6px; letter-spacing: 0; }
+.pick-row { display: flex; gap: 6px; align-items: stretch; }
+.dir-name {
+  flex: 1; min-width: 0; padding: 6px 8px; background: #222; border: 1px solid #3a3a3a; border-radius: 3px;
+  color: #e8e8e8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dir-name.none { color: #d8c65a; }
+.pick {
+  flex-shrink: 0; padding: 0 12px; border-radius: 3px; cursor: pointer; font: 700 11px/1 var(--mono);
+  background: #1c1c1c; border: 1px solid #454545; color: #ccc;
+}
+.pick:hover:not(:disabled) { background: #282828; color: #fff; }
+.pick:disabled { opacity: .5; cursor: not-allowed; }
 input {
   width: 100%; background: #222; border: 1px solid #3a3a3a; border-radius: 3px;
   color: #e8e8e8; font: 12px/1.2 var(--mono); padding: 6px 8px; outline: none;
@@ -243,7 +278,9 @@ input:disabled { opacity: .5; }
   <button class="close" title="Close (Esc)">&times;</button>
 </div>
 <div class="paths">
-  <label class="field"><span class="label">ROOT FOLDER <em>remembered</em></span>
+  <div class="field fs-only"><span class="label">SAVE TO <em>remembered</em></span>
+    <div class="pick-row"><span class="dir-name"></span><button class="pick">CHOOSE…</button></div></div>
+  <label class="field gm-only"><span class="label">ROOT FOLDER <em>inside Downloads; needs Tampermonkey "Browser API" download mode</em></span>
     <input class="root-in" type="text" spellcheck="false" placeholder="e.g. Music/Archive.org"></label>
   <label class="field"><span class="label">ALBUM FOLDER <em>defaults to the item id</em></span>
     <input class="album-in" type="text" spellcheck="false"></label>
@@ -284,18 +321,60 @@ input:disabled { opacity: .5; }
     // -------------------------------------------------------------------------
     // Folder fields
     // -------------------------------------------------------------------------
+    var dirName = $('.dir-name');
+    var pickBtn = $('.pick');
+    var dirHandle = null;   // FS mode: the folder the user picked
+
+    panel.querySelectorAll(hasFS ? '.gm-only' : '.fs-only').forEach(function (e) { e.hidden = true; });
+
     rootIn.value  = GM_getValue('rootPrefix', 'FLACDL');
     albumIn.value = itemId;
 
+    // FS mode: album folder inside the picked folder. GM mode: root/album inside Downloads.
     function saveFolder() {
-        return sanitizePath(rootIn.value + '/' + albumIn.value) || 'FLAC';
+        return hasFS
+            ? sanitizePath(albumIn.value)
+            : sanitizePath(rootIn.value + '/' + albumIn.value) || 'FLAC';
     }
 
     function updatePreview() {
-        preview.textContent = 'Downloads/';
-        preview.appendChild(el('b', null, saveFolder()));
-        preview.appendChild(document.createTextNode('/…'));
-        preview.title = 'Downloads/' + saveFolder() + '/';
+        var base = hasFS ? (dirHandle ? dirHandle.name : '?') : 'Downloads';
+        var sub  = saveFolder();
+        preview.textContent = base + '/';
+        if (sub) { preview.appendChild(el('b', null, sub)); preview.appendChild(document.createTextNode('/')); }
+        preview.appendChild(document.createTextNode('…'));
+        preview.title = base + '/' + (sub ? sub + '/' : '');
+        dirName.textContent = dirHandle ? dirHandle.name : 'no folder chosen';
+        dirName.classList.toggle('none', !dirHandle);
+    }
+
+    async function chooseDir() {
+        try {
+            dirHandle = await W.showDirectoryPicker({ id: 'flac-dl', mode: 'readwrite' });
+        } catch (e) {
+            if (e && e.name === 'AbortError') return null;   // user closed the picker
+            throw e;
+        }
+        try { await idbSet('dir', dirHandle); } catch (e) { /* not remembered; still usable now */ }
+        updatePreview();
+        return dirHandle;
+    }
+
+    // Needs a user gesture when the browser asks to re-confirm access.
+    async function ensureDir() {
+        if (!dirHandle && !(await chooseDir())) return null;
+        var p = await dirHandle.queryPermission({ mode: 'readwrite' });
+        if (p !== 'granted') p = await dirHandle.requestPermission({ mode: 'readwrite' });
+        return p === 'granted' ? dirHandle : null;
+    }
+
+    pickBtn.addEventListener('click', function () {
+        chooseDir().catch(function (e) { alert('Could not open folder: ' + e.message); });
+    });
+
+    if (hasFS) {
+        idbGet('dir').then(function (h) { if (h && !dirHandle) { dirHandle = h; updatePreview(); } })
+            .catch(function () { /* nothing remembered */ });
     }
 
     rootIn.addEventListener('input', function () {
@@ -383,11 +462,13 @@ input:disabled { opacity: .5; }
             skipped:   function () { set('skipped', '/', 'not started', '', '0%'); },
             cancelled: function () { set('cancelled', 'x', 'cancelled', 'err', '100%'); },
             done:      function () { set('done', '+', 'saved', 'ok', '100%'); },
+            existed:   function () { set('done', '=', 'already there', 'ok', '100%'); },
             active: function (attempt) {
                 set('active', '>', attempt > 1 ? 'try ' + attempt + '/' + MAX_ATTEMPTS : 'starting', 'indet', null);
                 reveal();
             },
             progress: function (loaded, total, rate) {
+                if (row.dataset.state !== 'active') return;
                 if (total > 0) {
                     var p = Math.min(100, loaded / total * 100);
                     bar.className = 'bar';
@@ -457,28 +538,89 @@ input:disabled { opacity: .5; }
         });
     }
 
-    async function downloadJob(job, r, folder) {
-        var name = folder + '/' + job.savePath;
+    // -------------------------------------------------------------------------
+    // Savers: one attempt at one file. Each resolves to
+    //   { ok: true [, existed: true] } | { ok: false, error, details } | { aborted: true }
+    // and registers an { abort } token in r.active while running.
+    // -------------------------------------------------------------------------
+
+    // Streams the response straight to disk in the picked folder. The browser
+    // writes to a temp file and only renames it into place on close(), so a
+    // cancelled or failed transfer never leaves a truncated .flac behind.
+    async function saveViaFS(job, r, baseDir, onProgress) {
+        var ctl = new AbortController(), aborted = false, writable = null, created = false, dir, fname;
+        var token = { abort: function () { aborted = true; ctl.abort(); } };
+        r.active.add(token);
+        try {
+            var parts = job.savePath.split('/');
+            fname = parts.pop();
+            dir = baseDir;
+            for (var i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+
+            var res = await fetch(job.url, { signal: ctl.signal });
+            if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
+            var total = parseInt(res.headers.get('content-length') || '0', 10);
+
+            // Same name and same size already on disk: treat as saved, so START resumes.
+            try {
+                var existing = await (await dir.getFileHandle(fname)).getFile();
+                if (total > 0 && existing.size === total) { ctl.abort(); return { ok: true, existed: true }; }
+            } catch (e) { created = true; /* not there yet */ }
+
+            writable = await (await dir.getFileHandle(fname, { create: true })).createWritable();
+            var reader = res.body.getReader(), loaded = 0;
+            for (;;) {
+                var chunk = await reader.read();
+                if (chunk.done) break;
+                await writable.write(chunk.value);
+                loaded += chunk.value.length;
+                onProgress(loaded, total);
+            }
+            if (total > 0 && loaded !== total) throw new Error('connection dropped at ' + fmtBytes(loaded) + ' of ' + fmtBytes(total));
+            await writable.close();
+            writable = null;
+            return { ok: true };
+        } catch (e) {
+            if (aborted) return { aborted: true };
+            return { ok: false, error: (e && e.message) || String(e) };
+        } finally {
+            r.active.delete(token);
+            if (writable) {
+                try { await writable.abort(); } catch (e) { /* already closed */ }
+                // getFileHandle(create) leaves an empty placeholder; drop it if it was ours.
+                if (created) { try { await dir.removeEntry(fname); } catch (e) { /* gone or locked */ } }
+            }
+        }
+    }
+
+    // Fallback where the folder picker doesn't exist (Firefox). Whether
+    // subfolders are honoured is up to the userscript manager.
+    async function saveViaGM(job, r, folder, onProgress) {
+        var dl = gmDownload(job.url, folder + '/' + job.savePath, function (e) { onProgress(e.loaded || 0, e.total || 0); });
+        r.active.add(dl);
+        var res = await dl.promise;
+        r.active.delete(dl);
+        return res;
+    }
+
+    async function downloadJob(job, r) {
         for (var attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             if (r.cancelled || r.halted) return 'cancelled';
             job.loaded = 0;
             job.total  = 0;
+            job.rate   = 0;
             job.row.active(attempt);
             var meter = makeMeter();
 
-            var dl = gmDownload(job.url, name, function (e) {
-                var loaded = e.loaded || 0;
+            var res = await r.save(job, r, function (loaded, total) {
                 if (loaded > job.loaded) r.bytes += loaded - job.loaded;
                 job.loaded = loaded;
-                if (e.total > 0) job.total = e.total;
-                job.row.progress(job.loaded, job.total, meter(job.loaded));
+                if (total > 0) job.total = total;
+                job.rate = meter(loaded);
                 scheduleRender();
             });
-            r.active.add(dl);
-            var res = await dl.promise;
-            r.active.delete(dl);
 
-            if (res.ok) return 'done';
+            if (res.ok) return res.existed ? 'existed' : 'done';
             if (res.aborted || r.cancelled) return 'cancelled';
 
             if (CONFIG_ERRORS[res.error]) {
@@ -504,19 +646,26 @@ input:disabled { opacity: .5; }
     function scheduleRender() {
         if (renderQueued) return;
         renderQueued = true;
-        requestAnimationFrame(function () { renderQueued = false; render(); });
+        // A timer, not rAF: rAF stops entirely in a backgrounded window.
+        setTimeout(function () { renderQueued = false; render(); }, 150);
     }
 
+    function idleLabel() { return 'DOWNLOAD ' + jobs.length + ' FLAC' + (jobs.length === 1 ? '' : 'S'); }
+
     function render() {
-        if (!run) { fab.textContent = 'DOWNLOAD ' + jobs.length + ' FLAC' + (jobs.length === 1 ? '' : 'S'); return; }
+        if (!run) { fab.textContent = idleLabel(); return; }
         var total = run.jobs.length;
         var frac  = run.finished;
-        run.inFlight.forEach(function (j) { if (j.total > 0) frac += Math.min(1, j.loaded / j.total); });
+        run.inFlight.forEach(function (j) {
+            if (j.total > 0) frac += Math.min(1, j.loaded / j.total);
+            if (j.loaded > 0) j.row.progress(j.loaded, j.total, j.rate);
+        });
         var pct = total ? Math.floor(frac / total * 100) : 0;
+        var tail = (run.existed ? ' · ' + run.existed + ' already there' : '') + (run.failed ? ' · ' + run.failed + ' failed' : '');
 
         if (run.running) {
             fab.textContent = run.finished + '/' + total + ' FLAC · ' + pct + '%';
-            oLabel.textContent = run.finished + ' / ' + total + ' done' + (run.failed ? ' · ' + run.failed + ' failed' : '');
+            oLabel.textContent = run.finished + ' / ' + total + ' done' + tail;
             oLabel.classList.remove('bad');
             oPct.textContent = pct + '%';
             oBar.style.width = pct + '%';
@@ -525,13 +674,12 @@ input:disabled { opacity: .5; }
             return;
         }
 
-        fab.textContent = 'DOWNLOAD ' + jobs.length + ' FLAC' + (jobs.length === 1 ? '' : 'S');
+        fab.textContent = idleLabel();
         var bad = run.cancelled || run.halted || run.failed > 0;
         oLabel.classList.toggle('bad', !!bad);
         oLabel.textContent = run.halted
             ? 'Stopped: ' + run.halted
-            : (run.cancelled ? 'Cancelled: ' : 'Done: ') + run.saved + ' / ' + total + ' saved' +
-              (run.failed ? ' · ' + run.failed + ' failed' : '');
+            : (run.cancelled ? 'Cancelled: ' : 'Done: ') + run.saved + ' / ' + total + ' saved' + tail;
         oPct.textContent = '';
         oBar.style.width = '100%';
         oBar.classList.toggle('bad', !!bad);
@@ -544,15 +692,14 @@ input:disabled { opacity: .5; }
         cancelBtn.disabled = false;
         retryBtn.hidden  = running || unfinished.length === 0;
         retryBtn.textContent = 'RETRY ' + unfinished.length + ' UNFINISHED';
-        rootIn.disabled = albumIn.disabled = running;
+        rootIn.disabled = albumIn.disabled = pickBtn.disabled = running;
         fab.classList.toggle('running', running);
-        startBtn.textContent = run && !running ? 'START OVER (ALL)' : 'START';
     }
 
-    async function runJobs(list) {
+    async function runJobs(list, save) {
         var r = run = {
-            jobs: list, running: true, cancelled: false, halted: null,
-            finished: 0, saved: 0, failed: 0, bytes: 0, meter: makeMeter(),
+            jobs: list, save: save, running: true, cancelled: false, halted: null,
+            finished: 0, saved: 0, existed: 0, failed: 0, bytes: 0, meter: makeMeter(),
             inFlight: new Set(), active: new Set(), waiters: new Set(), pump: null
         };
         unfinished = [];
@@ -563,18 +710,17 @@ input:disabled { opacity: .5; }
         setRunningUI(true);
         render();
 
-        var folder = saveFolder();
-        var queue  = list.slice();
-
+        var queue = list.slice();
         await new Promise(function (resolveAll) {
             r.pump = function () {
                 while (!r.cancelled && !r.halted && queue.length && r.inFlight.size < concurrency) {
                     var job = queue.shift();
                     r.inFlight.add(job);
-                    downloadJob(job, r, folder).then(function (job, result) {
+                    downloadJob(job, r).then(function (job, result) {
                         r.inFlight.delete(job);
                         r.finished++;
-                        if (result === 'done') { r.saved++; job.row.done(); }
+                        if (result === 'done')         { r.saved++; job.row.done(); }
+                        else if (result === 'existed') { r.saved++; r.existed++; job.row.existed(); }
                         else {
                             unfinished.push(job);
                             if (result === 'error') r.failed++;
@@ -600,10 +746,34 @@ input:disabled { opacity: .5; }
         render();
     }
 
-    startBtn.addEventListener('click', function () { runJobs(jobs.slice()); });
+    // Resolves the destination (asking for the folder / permission if needed)
+    // and returns a saver bound to it, or null if the user backed out.
+    async function prepareSaver() {
+        if (!hasFS) {
+            var folder = saveFolder();
+            return function (job, r, onProgress) { return saveViaGM(job, r, folder, onProgress); };
+        }
+        var base = await ensureDir();
+        if (!base) return null;
+        var sub = saveFolder();
+        var dir = base;
+        var segs = sub ? sub.split('/') : [];
+        for (var i = 0; i < segs.length; i++) dir = await dir.getDirectoryHandle(segs[i], { create: true });
+        return function (job, r, onProgress) { return saveViaFS(job, r, dir, onProgress); };
+    }
+
+    async function start(list) {
+        if (run && run.running) return;
+        var save;
+        try { save = await prepareSaver(); }
+        catch (e) { alert('Can\'t write to that folder: ' + e.message); return; }
+        if (save) runJobs(list, save);
+    }
+
+    startBtn.addEventListener('click', function () { start(jobs.slice()); });
 
     retryBtn.addEventListener('click', function () {
-        if (unfinished.length) runJobs(unfinished.slice());
+        if (unfinished.length) start(unfinished.slice());
     });
 
     cancelBtn.addEventListener('click', function () {
@@ -617,3 +787,4 @@ input:disabled { opacity: .5; }
 
     render();
 })();
+
